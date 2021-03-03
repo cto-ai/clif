@@ -1,0 +1,31 @@
+{
+  "name": "clif",
+  "version": "1.0.0-rc.0",
+  "description": "Command-line Interface Framework",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "tap --100 test/*.test.js",
+    "cov": "cov",
+    "lint": "standard",
+    "check": "npm test && npm run lint"
+  },
+  "precommit": [
+    "lint",
+    "test"
+  ],
+  "author": "David Mark Clements <dave@cto.ai>",
+  "license": "MIT",
+  "dependencies": {
+    "bloomrun": "^4.1.1",
+    "commist": "^1.1.0",
+    "debug": "^4.3.1",
+    "es-aggregate-error": "^1.0.5",
+    "minimist": "^1.2.5"
+  },
+  "devDependencies": {
+    "pre-commit": "^1.2.2",
+    "standard": "^16.0.3",
+    "tapx": "0.2.0"
+  }
+}
