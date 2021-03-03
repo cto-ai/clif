@@ -27,5 +27,17 @@
     "pre-commit": "^1.2.2",
     "standard": "^16.0.3",
     "tapx": "0.2.0"
-  }
+  },
+  "directories": {
+    "test": "test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cto-ai/clif.git"
+  },
+  "keywords": [],
+  "bugs": {
+    "url": "https://github.com/cto-ai/clif/issues"
+  },
+  "homepage": "https://github.com/cto-ai/clif#readme"
 }
