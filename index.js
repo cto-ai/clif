@@ -1,5 +1,5 @@
 import fs from 'fs'
-import { join } from 'path'
+import { join, basename } from 'path'
 import { spawnSync } from 'child_process'
 import commist from 'commist'
 import minimist from 'minimist'
@@ -13,11 +13,22 @@ const { constructor: AsyncGeneratorFunction } = async function * () {}
 
 process.on('SIGINT', () => process.exit(130))
 
-const handle = (meta, settings, matcher, done) => {
+const flagerify = (name) => name.replace(/^\$/, '').replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase()
+
+
+const version = async (matcher) => {
+  const { default: pkg } = await import('./package.cjs')
+  const { name, version } = pkg
+  const display = matcher.lookup({ ns: 'version', clif: { name, version } })
+  if (display) return display()
+  console.log(name, version)
+}
+
+const handle = ({ bin, command, settings, parents, meta, matcher, fallthrough }, done) => {
   const { positionals: posDec = [], default: director } = meta
   const config = Object.entries(meta)
     .filter(([[ch1]]) => ch1 === '$')
-    .map(([name, info]) => [name.slice(1), info])
+    .map(([name, info]) => [flagerify(name), info])
     .reduce((o, [name, { type, alias, initial }]) => {
       if (type === 'string') o.string.push(name)
       if (type === 'boolean') o.boolean.push(name)
@@ -26,18 +37,35 @@ const handle = (meta, settings, matcher, done) => {
       return o
     }, {
       string: [],
-      boolean: [],
-      alias: {},
+      boolean: ['help', 'version'],
+      alias: { help: 'h', version: 'v' },
       default: {},
       '--': true
     })
+
+  if (!director) {
+    return async (argv) => {
+      const { version: showVersion } = minimist(argv, config)
+      if (showVersion) {
+        await version(matcher)
+        return
+      }
+
+      if (meta.$.fallthrough && fallthrough) {
+        await fallthrough(argv)
+        return
+      }
+
+      await help({ bin, command, settings, parents, meta, matcher })(argv)
+    }
+  }
 
   return async (argv) => {
     try {
       const implicits = {
         flags: { raw: [] }
       }
-      const { _: args, '--': posteriors = [], ...flags } = minimist(argv, {
+      const { _: args, '--': posteriors = [], help: showHelp, version: showVersion, ...flags } = minimist(argv, {
         ...config,
         unknown (flag) {
           if (flag[0] !== '-') return true
@@ -45,6 +73,17 @@ const handle = (meta, settings, matcher, done) => {
           return false
         }
       })
+
+      if (showVersion) {
+        await version(matcher)
+        return
+      }
+
+      if (showHelp) {
+        await help({ bin, command, settings, parents, meta, matcher })(argv)
+        return
+      }
+
       implicits.positionals = args.slice(posDec.length)
       const positionals = Object.fromEntries(
         Object.entries(posDec).map(([ix, name]) => {
@@ -126,17 +165,106 @@ function define ({ command, parents, handler, program }) {
   }
 }
 
-const help = ({ command, meta, parents, structure, errors }) => {
-  if (!meta.$ || typeof meta.$.describe !== 'string') {
-    errors.push(SyntaxError(`Command ${command} is missing a description (needs $.describe)`))
-  }
-  return async (argv) => {
-    // TODO: generate help
-    console.log(meta.$.describe)
+const helpify = {
+  positionals (definitions) {
+    if (definitions.length === 0) return ''
+    return definitions.map(({ required, name }) => {
+      return required ? `<${name}>` : `[${name}]`
+    }).join(' ')
+  },
+  flags (definitions) {
+    if (definitions.length === 0) return ''
+    return '\n' + definitions.map(({ required, name, alias, type, describe }) => {
+      alias = Array.isArray(alias) ? alias.join(' | ') : alias
+      const alt =  alias ? ` | ${alias} ` : ' '
+      const flag = required ? `< ${name}${alt}>` : `[ ${name}${alt}]`
+      return `${flag} - ${describe} (${type}) `
+    }).join('\n') + '\n'
+  },
+  command (name) {
+    return name ? name + ' ' : ''
+  },
+  subcommands (definitions, { bin, command, breadcrumb }) {
+    if (definitions.length === 0) return ''
+    return '\n' + definitions.map(({name, describe }) => {
+      const cmd = helpify.command(command.name)
+      return `${bin}${helpify.breadcrumb(breadcrumb)}${cmd}${name} – ${describe}`
+    }).join('\n') + '\n'
+  },
+  breadcrumb (definitions) {
+    return definitions.length > 0 ? ` ${definitions.join(' ')} ` : ' '
+  },
+  unrecognized (argv, { bin, breadcrumb, command }) {
+    if (argv.length === 0) return ''
+    const cmd = helpify.command(command.name)
+    return `\nCommand not recognized: ${bin}${helpify.breadcrumb(breadcrumb)}${cmd}${argv.join(' ')}\n`
   }
 }
 
-async function compose ({ structure, settings, matcher, program = commist(), parents = [], errors, done }) {
+const usage = ({ bin, command, subcommands, breadcrumb, unrecognized }) => `${helpify.unrecognized(unrecognized, {bin, breadcrumb, command})}
+${command.describe}
+
+${bin}${helpify.breadcrumb(breadcrumb)}${helpify.command(command.name)}${helpify.positionals(command.positionals)}
+${helpify.flags(command.flags)}${helpify.subcommands(subcommands, { bin, command, breadcrumb })}`
+
+const dashify = (flag) => {
+  return (flag.length === 1) ? `-${flag}` : `--${flag}`
+}
+
+const flagInfo = (meta) => {
+  return Object.entries(meta).filter(([k]) => k !== '$' && k[0] === '$').map(([k, v]) => {
+    const name = dashify(flagerify(k))
+    const alias = Array.isArray(v.alias) ? v.alias.map(flagerify).map(dashify) : dashify(flagerify(v.alias))
+    
+    return {
+      name,
+      ...v,
+      alias
+    }
+  })
+}
+
+const positionalInfo = (positionals = []) => {
+  return positionals.map((positional) => {
+    const required = positional[0] === '<'
+    return { name: positional.replace(/[<|\[](.+)[>|\]]/, '$1'), required }
+  })
+}
+
+const help = ({ bin = '', command, meta, parents = [], matcher }) => {
+  return async (argv) => {
+    const unrecognized = argv.filter((arg) => arg !== '--help' && arg !== '-h')
+    const isLeaf = meta.default
+
+    if (isLeaf) {
+      const { describe, positionals = [] } = meta
+      const flags = flagInfo(meta)
+      const positionalDefs = positionalInfo(positionals)
+      const commandDef = { name: command, describe, positionals: positionalDefs, flags, leaf: true }
+      const pattern =  { ns: 'help', bin, argv, command: commandDef, subcommands: [], breadcrumb: parents, unrecognized }
+      const display = matcher.lookup(pattern) || ((pattern) => console.log(usage(pattern)))
+      await display(pattern)
+      return
+    }
+  
+    const { describe } = meta.$
+    const subcommands = Object.entries(meta).filter(([k]) => k !== '$').map(([subcommand, declaration]) => {
+      const { $, describe = $.describe, positionals = [] } = declaration
+      const flags = flagInfo(declaration)
+      const positionalDefs = positionalInfo(positionals)
+      const leaf = !!declaration.default
+      return { name: subcommand, describe, positionals: positionalDefs, flags, leaf }
+    })
+
+    const positionalDefs = positionalInfo(['<command>'])
+    const commandDef = { name: command, describe, positionals: positionalDefs, flags: [], leaf: true }
+    const pattern =  { ns: 'help', bin, argv, command: commandDef, describe, subcommands, breadcrumb: parents, unrecognized }
+    const display = matcher.lookup(pattern) || ((pattern) => console.log(usage(pattern)))
+    await display(pattern)
+  }
+}
+
+async function compose ({ bin, structure, settings, matcher, program = commist(), parents = [], errors, fallthrough, done }) {
   for (const [command, meta] of Object.entries(structure)) {
     if (command === '$') continue
     if (meta.default) {
@@ -145,14 +273,17 @@ async function compose ({ structure, settings, matcher, program = commist(), par
         errors.push(...errs)
         continue
       }
-      const handler = handle(meta, settings, matcher, done)
+      const handler = handle({ bin, command, settings, parents, meta, matcher }, done)
       define({ command, parents, handler, program })
       continue
     } else {
-      const handler = help({ command, parents, meta, structure, errors })
+      if (!meta.$ || typeof meta.$.describe !== 'string') {
+        errors.push(SyntaxError(`Command ${command} is missing a description (needs $.describe)`))
+      }
+      const handler = handle({ bin, command, settings, parents, meta, matcher, fallthrough }, done)
       define({ command, parents, handler, program })
     }
-    await compose({ structure: meta, settings, matcher, program, parents: [...parents, command], errors, done })
+    await compose({ bin, structure: meta, settings, matcher, program, parents: [...parents, command], errors, fallthrough, done })
   }
   return program
 }
@@ -185,23 +316,37 @@ async function loadPatterns (dir, errors) {
     const [ext] = ptn.name.split('.').reverse()
     if (ext !== 'js' && ext !== 'mjs') continue
     const path = join(dir, ptn.name)
-    const mod = await import(path)
-    const { default: declarations, ...actions } = mod
-    for (const [name, action] of Object.entries(actions)) {
-      if (typeof action !== 'function') continue // ignore non-function exports
-      if (typeof declarations[name] !== 'object' || declarations[name] === null) {
+    try { 
+      const mod = await import(path)
+      const { default: declarations, ...actions } = mod
+      if (!declarations) {
         errors.push(
-          new SyntaxError(`Pattern module ${path} export \`${name}\` must have a corresponding pattern object of the same name in the default export object`)
+          new SyntaxError(`Pattern module ${path} must have a default export object`)
         )
-      }
-    }
-
-    for (const [name, pattern] of Object.entries(declarations)) {
-      if (typeof actions[name] !== 'function') {
-        errors.push(new SyntaxError(`Pattern module ${path} default export property name \`${name}\` must have a corresponding exported function by the same name`))
         continue
       }
-      patterns.push([pattern, actions[name]])
+      for (const [name, action] of Object.entries(actions)) {
+        if (typeof action !== 'function') continue // ignore non-function exports
+        if (typeof declarations[name] !== 'object' || declarations[name] === null) {
+          errors.push(
+            new SyntaxError(`Pattern module ${path} export \`${name}\` must have a corresponding pattern object of the same name in the default export object`)
+          )
+        }
+      }
+
+      for (const [name, pattern] of Object.entries(declarations)) {
+        if (typeof actions[name] !== 'function') {
+          errors.push(new SyntaxError(`Pattern module ${path} default export property name \`${name}\` must have a corresponding exported function by the same name`))
+          continue
+        }
+        patterns.push([pattern, actions[name]])
+      }
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        const { stderr } = spawnSync(process.execPath, [path, '-c'], { encoding: 'utf-8' })
+        throw stderr
+      }
+      throw err
     }
   }
   return patterns
@@ -222,7 +367,10 @@ export class Fail extends Error {
   }
 }
 
-export default function clif ({ structure, settings, patterns, fallthrough }, argv = process.argv.slice(2)) {
+export default function clif (
+  { bin = basename(process.argv[1]), structure, settings, patterns, fallthrough },
+  argv = process.argv.slice(2)
+) {
   const matcher = bloomrun({ indexing: 'depth' })
   let resolve = null
   let reject = null
@@ -237,6 +385,7 @@ export default function clif ({ structure, settings, patterns, fallthrough }, ar
   async function build () {
     try {
       const errors = []
+    
       if (typeof patterns === 'string') patterns = loadPatterns(patterns, errors)
       if (typeof structure === 'string') structure = loadStructure(structure)
 
@@ -247,7 +396,7 @@ export default function clif ({ structure, settings, patterns, fallthrough }, ar
         err.patterns = patterns
         throw err
       }
-
+      
       for (const [pattern, action] of patterns) {
         if (typeof action !== 'function') {
           const err = new SyntaxError('All pattern actions must be functions')
@@ -255,12 +404,24 @@ export default function clif ({ structure, settings, patterns, fallthrough }, ar
           err.action = action
           errors.push(err)
         }
-        matcher.add(pattern, action)
+        register(pattern, action)
       }
+      
+      structure = await structure
+      settings = await settings
 
-      const program = await compose({ structure: await structure, settings: await settings, matcher, errors, done })
-
+      const program = await compose({ bin, structure, settings, matcher, errors, fallthrough, done })
+      
       if (errors.length > 0) throw AggregateError(errors)
+
+      const handler = handle({ bin, command: '', settings, parents: [], meta: structure, matcher, fallthrough }, done)
+      program.handler = handler
+
+      const [ first ] = argv
+      if (first === '-h' || first === '--help') {
+        argv.shift()
+        argv.push('--help')
+      }
 
       return program
     } catch (err) {
@@ -281,15 +442,11 @@ export default function clif ({ structure, settings, patterns, fallthrough }, ar
     started = true
     try {
       const program = await building
-      if (program.parse(argv) === argv) {
-        if (fallthrough) {
-          await fallthrough(argv)
-        } else {
-          throw Error(`Command not recognized: ${argv.join(' ')}`)
-        }
-      }
+
+      const parsed = program.parse(argv)
+      if (parsed === argv) await program.handler(argv)
+
     } catch (err) {
-      // TODO: show help
       reject(err)
     }
   }
